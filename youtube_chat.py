@@ -34,8 +34,8 @@ st.markdown("Chat with any YouTube video or just hang out!")
 
 with st.sidebar:
     st.header("📹 Video Settings")
-    current_video_id = st.session_state.video_id if st.session_state.video_id else "aircAruvnKk"
-    video_id = st.text_input("YouTube Video ID", value=current_video_id, help="The part after v= in YouTube URL")
+
+    video_id = st.text_input("YouTube Video ID", value="", help="The part after v= in YouTube URL before ?")
     
     if st.button("🔄 Load Video"):
         st.session_state.vector_store = None
@@ -64,7 +64,7 @@ needs_loading = (
     st.session_state.video_id != video_id
 )
 
-if needs_loading:
+if needs_loading and video_id:
     with st.spinner("🎥 Loading video transcript..."):
         try:
             ytt_api = YouTubeTranscriptApi()
