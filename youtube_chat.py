@@ -5,52 +5,82 @@ os.environ["SSL_CERT_FILE"] = ""
 
 import streamlit as st
 from dotenv import load_dotenv
-from langchain_huggingface import HuggingFaceEmbeddings, HuggingFaceEndpoint
+from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint, HuggingFaceEmbeddings
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
-from sentence_transformers import CrossEncoder
 
 # Load env
 load_dotenv()
+
+# ==========================================
+# INITIALIZE SESSION STATE FIRST
+# ==========================================
+if "vector_store" not in st.session_state:
+    st.session_state.vector_store = None
+if "video_id" not in st.session_state:
+    st.session_state.video_id = None
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "conversation_memory" not in st.session_state:
+    st.session_state.conversation_memory = []
+if "reranker" not in st.session_state:
+    from sentence_transformers import CrossEncoder
+    st.session_state.reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
 
 # ==========================================
 # PAGE CONFIG
 # ==========================================
 st.set_page_config(page_title="YouTube RAG Chat", layout="wide")
 st.title("🎬 YouTube RAG Chatbot")
-st.markdown("Chat with any YouTube video using AI")
+st.markdown("Chat with any YouTube video or just hang out!")
 
 # ==========================================
-# SIDEBAR - VIDEO INPUT
+# SIDEBAR - VIDEO INPUT & MEMORY
 # ==========================================
 with st.sidebar:
     st.header("📹 Video Settings")
-    video_id = st.text_input("YouTube Video ID", value="aircAruvnKk", help="The part after v= in YouTube URL")
+    
+    # Use current video_id from state or default
+    current_video_id = st.session_state.video_id if st.session_state.video_id else "aircAruvnKk"
+    video_id = st.text_input("YouTube Video ID", value=current_video_id, help="The part after v= in YouTube URL")
     
     if st.button("🔄 Load Video"):
-        st.session_state.clear()
+        # Clear video data but keep chat history
+        st.session_state.vector_store = None
+        st.session_state.video_id = None
         st.rerun()
     
     st.markdown("---")
-    st.markdown("**Features Enabled:**")
-    st.markdown("✅ Query Rewriting")
-    st.markdown("✅ MMR Retrieval")
-    st.markdown("✅ Cross-Encoder Reranking")
+    
+    # Status - check AFTER initialization
+    st.markdown("**Status:**")
+    if st.session_state.vector_store is not None and st.session_state.video_id == video_id:
+        st.markdown(f"✅ Video loaded: `{st.session_state.video_id}`")
+    else:
+        st.markdown("⏳ No video loaded")
+    
+    # Memory management
+    st.markdown("---")
+    st.header("🧠 Memory")
+    if st.button("🗑️ Clear Chat History"):
+        st.session_state.chat_history = []
+        st.session_state.conversation_memory = []
+        st.rerun()
+    
+    msg_count = len(st.session_state.conversation_memory)
+    st.markdown(f"Messages in memory: {msg_count}")
 
 # ==========================================
-# INITIALIZE SESSION STATE
+# LOAD VIDEO (runs when needed)
 # ==========================================
-if "vector_store" not in st.session_state:
-    st.session_state.vector_store = None
-if "reranker" not in st.session_state:
-    st.session_state.reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+needs_loading = (
+    st.session_state.vector_store is None or 
+    st.session_state.video_id != video_id
+)
 
-# ==========================================
-# LOAD VIDEO (runs once)
-# ==========================================
-if st.session_state.vector_store is None:
+if needs_loading:
     with st.spinner("🎥 Loading video transcript..."):
         try:
             ytt_api = YouTubeTranscriptApi()
@@ -85,17 +115,35 @@ if st.session_state.vector_store is None:
             
             embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
             st.session_state.vector_store = FAISS.from_documents(documents, embeddings)
+            st.session_state.video_id = video_id
             
-            st.success(f"✅ Loaded {len(documents)} chunks from video!")
+            # Add system message about video
+            video_msg = f"📺 Loaded video: {video_id} ({len(documents)} chunks)"
+            st.session_state.chat_history.append({"role": "assistant", "content": video_msg})
+            
+            st.sidebar.success(f"✅ Loaded {len(documents)} chunks!")
+            st.rerun()  # Refresh to update sidebar status
             
         except TranscriptsDisabled:
-            st.error("❌ No captions available for this video.")
+            st.sidebar.error("❌ No captions available")
+            st.session_state.video_id = None
         except Exception as e:
-            st.error(f"❌ Error: {str(e)}")
+            st.sidebar.error(f"❌ Error: {str(e)}")
+            st.session_state.video_id = None
 
 # ==========================================
-# REWRITE LLM SETUP
+# LLM SETUP
 # ==========================================
+@st.cache_resource
+def get_llm():
+    llm = HuggingFaceEndpoint(
+        repo_id="deepseek-ai/DeepSeek-V3",
+        task="conversational",
+        temperature=0.8,
+        max_new_tokens=512,
+    )
+    return ChatHuggingFace(llm=llm)
+
 @st.cache_resource
 def get_rewrite_llm():
     llm = HuggingFaceEndpoint(
@@ -106,16 +154,48 @@ def get_rewrite_llm():
     )
     return llm
 
+llm = get_llm()
 rewrite_llm = get_rewrite_llm()
 
 # ==========================================
-# QUERY REWRITING
+# MEMORY & RETRIEVAL FUNCTIONS
 # ==========================================
+def get_conversation_context(max_messages=6):
+    """Get recent conversation history for context"""
+    recent = st.session_state.conversation_memory[-max_messages:]
+    context = ""
+    for msg in recent:
+        role = "User" if msg["type"] == "human" else "Assistant"
+        context += f"{role}: {msg['content']}\n"
+    return context
+
+def add_to_memory(user_msg, assistant_msg):
+    """Add exchange to conversation memory"""
+    st.session_state.conversation_memory.append({
+        "type": "human",
+        "content": user_msg
+    })
+    st.session_state.conversation_memory.append({
+        "type": "ai",
+        "content": assistant_msg
+    })
+
 def rewrite_query(question):
-    """Rewrite query for better retrieval"""
-    prompt = f"""Rewrite this question to be more specific for searching a video transcript.
+    """Rewrite query considering conversation history"""
+    context = get_conversation_context(max_messages=4)
+    
+    if not context:
+        prompt = f"""Rewrite this question to be more specific for searching a video transcript.
 Original: {question}
 Rewritten:"""
+    else:
+        prompt = f"""Given this conversation history:
+{context}
+
+Rewrite the user's latest question to be more specific for searching a video transcript, considering the context.
+Original: {question}
+Rewritten:"""
+    
     try:
         rewritten = rewrite_llm.invoke(prompt)
         result = str(rewritten).strip().split("\n")[0]
@@ -123,9 +203,6 @@ Rewritten:"""
     except:
         return question
 
-# ==========================================
-# RERANKING
-# ==========================================
 def rerank_docs(query, docs):
     """Rerank using cross-encoder"""
     if not docs:
@@ -139,38 +216,127 @@ def rerank_docs(query, docs):
     
     return [doc for doc, score in scored_docs[:3]]
 
-# ==========================================
-# RETRIEVAL DEMO INTERFACE
-# ==========================================
-if st.session_state.vector_store:
-    st.subheader("🔍 Test Retrieval Pipeline")
-    
-    query = st.text_input("Enter a test query:", placeholder="What does the video say about...")
-    
-    if query:
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("**Step 1: Query Rewriting**")
-            rewritten = rewrite_query(query)
-            st.write(f"Original: {query}")
-            st.write(f"Rewritten: {rewritten}")
-        
-        with col2:
-            st.markdown("**Step 2: MMR Retrieval**")
-            retriever = st.session_state.vector_store.as_retriever(
-                search_type="mmr",
-                search_kwargs={"k": 6, "fetch_k": 12, "lambda_mult": 0.5}
-            )
-            raw_docs = retriever.invoke(rewritten)
-            st.write(f"Retrieved {len(raw_docs)} chunks")
-            for i, doc in enumerate(raw_docs[:3]):
-                st.write(f"{i+1}. [{doc.metadata['source']}] {doc.page_content[:100]}...")
-        
-        st.markdown("**Step 3: Cross-Encoder Reranking**")
-        reranked = rerank_docs(rewritten, raw_docs)
-        for i, doc in enumerate(reranked):
-            st.write(f"**Rank {i+1}** [{doc.metadata['source']}] {doc.page_content[:150]}...")
+def format_docs(docs):
+    """Format with source citations"""
+    formatted = []
+    for doc in docs:
+        source = doc.metadata.get("source", "Unknown")
+        text = doc.page_content
+        formatted.append(f"[{source}] {text}")
+    return "\n\n".join(formatted)
 
-else:
-    st.info("👈 Enter a YouTube Video ID and click 'Load Video' to start!")
+def is_video_question(question):
+    """Detect if user is asking about the video or just chatting"""
+    video_keywords = [
+        "video", "say", "mention", "talk about", "discuss", "explain", 
+        "what does", "how does", "why does", "when did", "who is", 
+        "transcript", "speaker", "author", "content", "topic", "learn",
+        "it", "that", "this", "those", "these"
+    ]
+    question_lower = question.lower()
+    return any(keyword in question_lower for keyword in video_keywords)
+
+# ==========================================
+# MAIN CHAT INTERFACE
+# ==========================================
+# Display chat history
+for msg in st.session_state.chat_history:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# User input
+user_question = st.chat_input("Type anything... ask about the video or just chat!")
+
+if user_question:
+    # Show user message
+    st.chat_message("user").markdown(user_question)
+    st.session_state.chat_history.append({"role": "user", "content": user_question})
+    
+    with st.spinner(""):
+        
+        # Get conversation context
+        conversation_context = get_conversation_context(max_messages=6)
+        
+        # Check if video is loaded and question is video-related
+        video_context = ""
+        sources = []
+        use_video = False
+        
+        if st.session_state.vector_store:
+            is_followup = any(word in user_question.lower() for word in ["it", "that", "this", "those", "these", "he", "she", "they"])
+            
+            if is_video_question(user_question) or is_followup:
+                use_video = True
+                rewritten = rewrite_query(user_question)
+                
+                retriever = st.session_state.vector_store.as_retriever(
+                    search_type="mmr",
+                    search_kwargs={"k": 6, "fetch_k": 12, "lambda_mult": 0.5}
+                )
+                raw_docs = retriever.invoke(rewritten)
+                reranked_docs = rerank_docs(rewritten, raw_docs)
+                
+                if reranked_docs:
+                    video_context = format_docs(reranked_docs)
+                    sources = reranked_docs
+        
+        # Build dynamic prompt with memory
+        if video_context and conversation_context:
+            prompt = f"""You're chatting with a user. You remember the conversation and have access to a YouTube video transcript.
+
+Conversation history:
+{conversation_context}
+
+Video context:
+{video_context}
+
+User's latest message: {user_question}
+
+Respond naturally, referencing the conversation history when relevant. Use video info with timestamps [MM:SS] when discussing content. Be conversational and friendly."""
+        
+        elif video_context:
+            prompt = f"""You're chatting with a user about a YouTube video.
+
+Video context:
+{video_context}
+
+User: {user_question}
+
+Respond naturally using the video info. Add timestamps [MM:SS] when referencing specific parts. Be conversational and friendly."""
+        
+        elif conversation_context:
+            prompt = f"""You're having a conversation with a user. You remember what was discussed.
+
+Conversation history:
+{conversation_context}
+
+User's latest message: {user_question}
+
+Respond naturally, referencing previous parts of the conversation when relevant. Be friendly and engaging."""
+        
+        else:
+            prompt = f"""You're having a casual conversation with a user.
+
+User: {user_question}
+
+Respond naturally and conversationally. Be friendly and engaging."""
+        
+        response = llm.invoke(prompt)
+        answer = response.content if hasattr(response, 'content') else str(response)
+        
+        # Display assistant response
+        with st.chat_message("assistant"):
+            st.markdown(answer)
+            
+            # Optional: subtle source indicator only for video questions
+            if sources and use_video:
+                with st.expander("📚 Sources", expanded=False):
+                    for doc in sources:
+                        st.write(f"**[{doc.metadata['source']}]** {doc.page_content[:100]}...")
+        
+        # Save to both histories
+        st.session_state.chat_history.append({"role": "assistant", "content": answer})
+        add_to_memory(user_question, answer)
+
+if not st.session_state.vector_store:
+    st.info("👈 Load a YouTube video to enable video Q&A, or just chat with me!")
