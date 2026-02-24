@@ -25,7 +25,6 @@ if "chat_history" not in st.session_state:
 if "conversation_memory" not in st.session_state:
     st.session_state.conversation_memory = []
 if "reranker" not in st.session_state:
-    if "reranker" not in st.session_state:
     import torch
     from sentence_transformers import CrossEncoder
     device = "cuda" if torch.cuda.is_available() else "cpu"
