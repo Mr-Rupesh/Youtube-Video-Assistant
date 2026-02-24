@@ -1,5 +1,6 @@
 import os
 import certifi
+import requests
 import streamlit as st
 
 os.environ["HUGGINGFACEHUB_API_TOKEN"] = st.secrets["HUGGINGFACEHUB_API_TOKEN"]
@@ -9,7 +10,6 @@ os.environ["GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"] = certifi.where()
 
 from dotenv import load_dotenv
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint, HuggingFaceEmbeddings
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
@@ -69,17 +69,30 @@ needs_loading = (
 if needs_loading and video_id:
     with st.spinner("🎥 Loading video transcript..."):
         try:
-            ytt_api = YouTubeTranscriptApi()
-            transcript_list = ytt_api.fetch(video_id, languages=["en"])
-            
+            # Fetch transcript via Supadata API (bypasses YouTube cloud IP blocks)
+            resp = requests.get(
+                "https://api.supadata.ai/v1/youtube/transcript",
+                params={"url": f"https://www.youtube.com/watch?v={video_id}", "lang": "en"},
+                headers={"x-api-key": st.secrets["SUPADATA_API_KEY"]},
+            )
+            if resp.status_code != 200:
+                raise ValueError(f"Supadata error {resp.status_code}: {resp.text}")
+
+            data = resp.json()
             chunks_with_time = []
-            for chunk in transcript_list:
-                chunks_with_time.append({
-                    "text": chunk.text,
-                    "start": int(chunk.start),
-                    "duration": chunk.duration
-                })
-            
+            for item in data.get("content", []):
+                text = item.get("text", "").strip()
+                if text:
+                    start = int(item.get("offset", 0) / 1000)
+                    chunks_with_time.append({
+                        "text": text,
+                        "start": start,
+                        "duration": item.get("duration", 0) / 1000,
+                    })
+
+            if not chunks_with_time:
+                raise ValueError("No transcript content returned for this video.")
+
             transcript = " ".join(c["text"] for c in chunks_with_time)
             splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
             texts = splitter.split_text(transcript)
@@ -108,8 +121,8 @@ if needs_loading and video_id:
             st.sidebar.success(f"✅ Loaded {len(documents)} chunks!")
             st.rerun()
             
-        except TranscriptsDisabled:
-            st.sidebar.error("❌ No captions available")
+        except ValueError as e:
+            st.sidebar.error(f"❌ {str(e)}")
             st.session_state.video_id = None
         except Exception as e:
             st.sidebar.error(f"❌ Error: {str(e)}")
