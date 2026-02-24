@@ -15,5 +15,6 @@ python-dotenv
 pandas
 numpy
 requests
-youtube-transcript-api
+yt-dlp
 certifi
+
