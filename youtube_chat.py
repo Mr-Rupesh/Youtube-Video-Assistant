@@ -25,8 +25,11 @@ if "chat_history" not in st.session_state:
 if "conversation_memory" not in st.session_state:
     st.session_state.conversation_memory = []
 if "reranker" not in st.session_state:
+    if "reranker" not in st.session_state:
+    import torch
     from sentence_transformers import CrossEncoder
-    st.session_state.reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    st.session_state.reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', device=device, max_length=512)
 
 st.set_page_config(page_title="YouTube RAG Chat", layout="wide")
 st.title("🎬 YouTube RAG Chatbot")
