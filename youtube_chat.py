@@ -9,7 +9,9 @@ os.environ["GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"] = certifi.where()
 
 from dotenv import load_dotenv
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint, HuggingFaceEmbeddings
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
+import yt_dlp
+import json
+import re
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
@@ -34,8 +36,8 @@ st.markdown("Chat with any YouTube video or just hang out!")
 
 with st.sidebar:
     st.header("📹 Video Settings")
-
-    video_id = st.text_input("YouTube Video ID", value="", help="The part after v= in YouTube URL before ?")
+    current_video_id = st.session_state.video_id if st.session_state.video_id else "aircAruvnKk"
+    video_id = st.text_input("YouTube Video ID", value=current_video_id, help="The part after v= in YouTube URL")
     
     if st.button("🔄 Load Video"):
         st.session_state.vector_store = None
@@ -64,19 +66,46 @@ needs_loading = (
     st.session_state.video_id != video_id
 )
 
-if needs_loading and video_id:
+if needs_loading:
     with st.spinner("🎥 Loading video transcript..."):
         try:
-            ytt_api = YouTubeTranscriptApi()
-            transcript_list = ytt_api.fetch(video_id, languages=["en"])
+            # Fetch transcript using yt-dlp (bypasses cloud IP blocks)
+            ydl_opts = {
+                "writesubtitles": True,
+                "writeautomaticsub": True,
+                "subtitleslangs": ["en"],
+                "subtitlesformat": "json3",
+                "skip_download": True,
+                "quiet": True,
+            }
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                subtitles = info.get("subtitles", {}) or info.get("automatic_captions", {})
+                if "en" not in subtitles:
+                    raise ValueError("No English transcript available for this video.")
+                sub_data = subtitles["en"]
+                # Prefer json3 format
+                json3_entry = next((s for s in sub_data if s.get("ext") == "json3"), None)
+                if not json3_entry:
+                    raise ValueError("Could not find json3 subtitle format.")
+                import urllib.request
+                with urllib.request.urlopen(json3_entry["url"]) as resp:
+                    raw = json.loads(resp.read().decode())
             
             chunks_with_time = []
-            for chunk in transcript_list:
-                chunks_with_time.append({
-                    "text": chunk.text,
-                    "start": int(chunk.start),
-                    "duration": chunk.duration
-                })
+            for event in raw.get("events", []):
+                segs = event.get("segs")
+                if not segs:
+                    continue
+                text = "".join(s.get("utf8", "") for s in segs).strip()
+                text = re.sub(r"\s+", " ", text)
+                if text:
+                    chunks_with_time.append({
+                        "text": text,
+                        "start": int(event.get("tStartMs", 0) / 1000),
+                        "duration": event.get("dDurationMs", 0) / 1000,
+                    })
             
             transcript = " ".join(c["text"] for c in chunks_with_time)
             splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
@@ -106,8 +135,8 @@ if needs_loading and video_id:
             st.sidebar.success(f"✅ Loaded {len(documents)} chunks!")
             st.rerun()
             
-        except TranscriptsDisabled:
-            st.sidebar.error("❌ No captions available")
+        except ValueError as e:
+            st.sidebar.error(f"❌ {str(e)}")
             st.session_state.video_id = None
         except Exception as e:
             st.sidebar.error(f"❌ Error: {str(e)}")
